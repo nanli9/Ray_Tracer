@@ -25,6 +25,7 @@
 #endif
 
 #include <imageIO.h>
+#include <cmath>
 
 #include "ray.h"
 
@@ -48,6 +49,15 @@ int mode = MODE_DISPLAY;
 
 // The field of view of the camera, in degrees.
 #define fov 60.0
+
+vector3 cameraPos = vector3(0, 0, 0);
+float focal_length = 1;
+float viewport_height = 2 * sqrt(3)/3;
+float viewport_width = 8 * sqrt(3) / 9;
+vector3 pixel_delta_u = vector3(viewport_width / WIDTH,0,0);
+vector3 pixel_delta_v = vector3(0, viewport_height / HEIGHT, 0);
+vector3 viewport_bottom_left = cameraPos - vector3(0, viewport_height / 2, 0) - vector3(viewport_width / 2, 0, 0) - vector3(0,0, focal_length);
+vector3 pixel00_pos = viewport_bottom_left + (pixel_delta_u + pixel_delta_v) * 0.5;
 
 // Buffer to store the image when saving it to a JPEG.
 unsigned char buffer[HEIGHT][WIDTH][3];
@@ -93,7 +103,126 @@ int num_lights = 0;
 void plot_pixel_display(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 void plot_pixel_jpeg(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 void plot_pixel(int x,int y,unsigned char r,unsigned char g,unsigned char b);
+void clampColor(point3& color)
+{
+    color.x = min(1.0, color.x);
+    color.y = min(1.0, color.y);
+    color.z = min(1.0, color.z);
+}
+point3 Illumination(vector3 normal, Light light, point3 p, Sphere sphere, Triangle triangle, bool sphereOrTriangle,float alpha = 0, float beta = 0, float gamma = 0)
+{
+    point3 I_total = point3();
+    point3 I_ambient = point3(ambient_light);
+    point3 I_diffuse, I_specular;
+    vector3 L = point3(light.position) - p;
+    L.normalize();
+    if(sphereOrTriangle)
+        I_diffuse = (point3(sphere.color_diffuse) * (max(0, L.dot(normal))));
+    else
+    {
+        point3 averageDiffuse = point3(triangle.v[0].color_diffuse)* alpha + point3(triangle.v[1].color_diffuse) * beta + point3(triangle.v[2].color_diffuse) * gamma;
+        I_diffuse = (averageDiffuse * (max(0, L.dot(normal))));
 
+    }
+    vector3 v = cameraPos - p;
+    v.normalize();
+    vector3 I = point3(light.position) - p;
+    I.normalize();
+    vector3 r = normal * I.dot(normal) * -2 + I;
+    r.normalize();
+    float cos_Phi = v.dot(r);
+    if (sphereOrTriangle)
+        I_specular = point3(sphere.color_specular) * pow(cos_Phi,sphere.shininess);
+    else
+    {
+        point3 averageSpecular = point3(triangle.v[0].color_specular) * alpha + point3(triangle.v[1].color_specular) * beta + point3(triangle.v[2].color_specular) * gamma;
+        float averageShiness = triangle.v[0].shininess * alpha + triangle.v[1].shininess * beta + triangle.v[2].shininess * gamma ;
+        I_specular = averageSpecular* pow(cos_Phi, averageShiness);
+
+    }
+    I_total = (I_diffuse + I_specular + I_ambient).multiplication(light.color);
+    clampColor(I_total);
+    return I_total * 255.0f;
+}
+bool hitSpheres(point3 origin, vector3 direction, float& t_min, point3& color,int& sphereIndex,bool isShadowRay, Light light = lights[0])
+{
+    bool res = false;
+    for (int i = 0; i < num_spheres; i++)
+    {
+        if ((isShadowRay && i != sphereIndex) || !isShadowRay)
+        {
+            vector3 oc = vector3(spheres[i].position) - origin;
+            float catheti = oc.dot(direction);
+            float d_2 = oc.len_2() - catheti * catheti;
+            float t = catheti - sqrt(spheres[i].radius * spheres[i].radius - d_2);
+            point3 p = origin + direction * t;
+            if (d_2 <= spheres[i].radius * spheres[i].radius && t > 0)
+            {
+                if (t < t_min && t > 0)
+                {
+                    if (!isShadowRay)
+                    {
+                        vector3 normal = p - point3(spheres[i].position);
+                        normal.normalize();
+                        color = Illumination(normal, light, p, spheres[i], triangles[0], true);
+                        t_min = t;
+                        sphereIndex = i;
+                        res = true;
+                    }
+                    else
+                        return true;
+                }
+            }
+        }
+    }
+    return res;
+}
+bool hitTriangles(point3 origin, vector3 direction, float& t_min, point3& color, int& triangleIndex, bool isShadowRay, Light light = lights[0])
+{
+    bool res = false;
+    for (int i = 0; i < num_triangles; i++)
+    {
+        if ((isShadowRay && i != triangleIndex) || !isShadowRay)
+        {
+            vector3 v0_v1 = point3(triangles[i].v[1].position) - point3(triangles[i].v[0].position);
+            vector3 v0_v2 = point3(triangles[i].v[2].position) - point3(triangles[i].v[0].position);
+            vector3 n = v0_v1.cross(v0_v2);
+            float d = -n.dot(point3(triangles[i].v[0].position));
+            float t = -(d + n.dot(origin)) / (n.dot(direction));
+            point3 p = origin + direction * t;
+          
+            float s = n.len_2();
+            vector3 p_v0 = point3(triangles[i].v[0].position) - p;
+            vector3 p_v1 = point3(triangles[i].v[1].position) - p;
+            vector3 p_v2 = point3(triangles[i].v[2].position) - p;
+
+            float s1 = (p_v1.cross(p_v2)).dot(n);
+            float s2 = (p_v2.cross(p_v0)).dot(n);
+            float s3 = (p_v0.cross(p_v1)).dot(n);
+            float a = s1/s, b = s2/s, c = 1 - a - b;
+            if (a >= 0 && b >= 0 && c >= 0)
+            {
+                if (t < t_min && t>0)
+                {
+                    if (!isShadowRay)
+                    {
+                        vector3 normal = point3(triangles[i].v[0].normal)*a + point3(triangles[i].v[1].normal)*b + point3(triangles[i].v[2].normal)*c;
+                        normal.normalize();
+                        color = Illumination(normal, light, p, spheres[0], triangles[i], false,a,b,c);
+                        //color = vector3((direction.x + 1) * 0.5, (direction.y + 1) * 0.5, 1.0) * 255;
+                        t_min = t;
+                        triangleIndex = i;
+                        res = true;
+                    }
+                    else
+                        return true;
+                        
+                }
+            }
+        }
+    }
+    return res;
+}
 void draw_scene()
 {
   for(unsigned int x=0; x<WIDTH; x++)
@@ -106,14 +235,35 @@ void draw_scene()
     {
       // A simple R,G,B output for testing purposes.
       // Modify these R,G,B colors to the values computed by your ray tracer.
-
-
-      unsigned char r = x % 256; // modify
-      unsigned char g = y % 256; // modify
-      unsigned char b = 1 % 256; // modify
-
-
-      plot_pixel(x, y, r, g, b);
+        vector3 dir = pixel00_pos + pixel_delta_u * x + pixel_delta_v * y - cameraPos;
+        dir.normalize();
+        ray r = ray(cameraPos, dir);
+        point3 color = point3(255,255,255);
+        float t_min = INT_MAX;
+        int sphereIndex = -1;
+        int triangleIndex = -1;
+        //check for sphere
+        hitSpheres(cameraPos, r.direction, t_min, color, sphereIndex, false);
+        //check for triangles
+        hitTriangles(cameraPos, r.direction, t_min, color, triangleIndex, false);
+        //check if ray is in shadow
+        if (t_min != INT_MAX)
+        {
+            point3 p = cameraPos + r.direction * t_min;
+            for (int i = 0; i < num_lights; i++)
+            {
+                vector3 shadowRayDir = point3(lights[i].position) - p;
+                shadowRayDir.normalize();
+                ray shadowCheckRay = ray(p, shadowRayDir);
+                //if ray is block by sphere or triangles then it becomes black
+                if (hitSpheres(p, shadowRayDir, t_min, color, sphereIndex, true, lights[i]) || hitTriangles(p, shadowRayDir, t_min, color, triangleIndex, true, lights[i]))
+                {
+                    color = vector3(0, 0, 0);
+                    break;
+                }
+            }
+        }
+      plot_pixel(x, y, color.x, color.y, color.z);
     }
     glEnd();
     glFlush();
